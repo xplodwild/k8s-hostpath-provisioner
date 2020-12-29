@@ -44,6 +44,7 @@ rules:
   - ""
   resources:
   - events
+  - endpoints
   verbs:
   - create
   - patch

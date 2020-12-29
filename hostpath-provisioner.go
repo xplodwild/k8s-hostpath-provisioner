@@ -19,6 +19,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"fmt"
@@ -29,15 +30,14 @@ import (
 	"time"
 
 	"github.com/golang/glog"
-	"github.com/kubernetes-incubator/external-storage/lib/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/controller"
+	"sigs.k8s.io/sig-storage-lib-external-provisioner/v6/util"
 	"github.com/pkg/xattr"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
-	"k8s.io/kubernetes/pkg/api/v1/helper"
 	"syscall"
 )
 
@@ -77,32 +77,32 @@ var _ controller.Provisioner = &hostPathProvisioner{}
  * volume referencing it as a hostPath.  The volume is annotated with our
  * provisioner id, so multiple provisioners can run on the same cluster.
  */
-func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.PersistentVolume, error) {
+func (p *hostPathProvisioner) Provision(ctx context.Context, options controller.ProvisionOptions) (*v1.PersistentVolume, controller.ProvisioningState, error) {
 	/*
 	 * Fetch the PV root directory from the PV storage class.
 	 */
-	params, err := p.parseParameters(options.Parameters)
+	params, err := p.parseParameters(options.StorageClass.Parameters)
 	if err != nil {
-		return nil, err
+		return nil, controller.ProvisioningFinished, err
 	}
 
 	/*
 	 * Extract the PV capacity as bytes.  We can use this to set CephFS
 	 * quotas.
 	 */
-	capacity := options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)]
+	capacity := options.PVC.Spec.Resources.Requests[v1.ResourceStorage]
 	volbytes := capacity.Value()
 	glog.Infof("pv storage: %+v", volbytes)
 
 	if volbytes <= 0 {
-		return nil, fmt.Errorf("storage capacity must be >= 0 (not %+v)", capacity.String())
+		return nil, controller.ProvisioningFinished, fmt.Errorf("storage capacity must be >= 0 (not %+v)", capacity.String())
 	}
 
 	/* Create the on-disk directory. */
 	path := path.Join(params.pvDir, options.PVName)
 	if err := os.MkdirAll(path, 0777); err != nil {
 		glog.Errorf("failed to mkdir %s: %s", path, err)
-		return nil, err
+		return nil, controller.ProvisioningFinished, err
 	}
 
 	/* Set CephFS quota, if enabled */
@@ -112,7 +112,7 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 			glog.Errorf("could not set CephFS quota on %s (%s): %s",
 				options.PVName, path, err)
 			os.RemoveAll(path)
-			return nil, err
+			return nil, controller.ProvisioningFinished, err
 		}
 	}
 
@@ -125,10 +125,10 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 			},
 		},
 		Spec: v1.PersistentVolumeSpec{
-			PersistentVolumeReclaimPolicy: options.PersistentVolumeReclaimPolicy,
+			PersistentVolumeReclaimPolicy: *options.StorageClass.ReclaimPolicy,
 			AccessModes:                   options.PVC.Spec.AccessModes,
 			Capacity: v1.ResourceList{
-				v1.ResourceName(v1.ResourceStorage): options.PVC.Spec.Resources.Requests[v1.ResourceName(v1.ResourceStorage)],
+				v1.ResourceStorage: options.PVC.Spec.Resources.Requests[v1.ResourceStorage],
 			},
 			PersistentVolumeSource: v1.PersistentVolumeSource{
 				HostPath: &v1.HostPathVolumeSource{
@@ -141,13 +141,13 @@ func (p *hostPathProvisioner) Provision(options controller.VolumeOptions) (*v1.P
 	glog.Infof("successfully created hostpath volume %s (%s)",
 		options.PVName, path)
 
-	return pv, nil
+	return pv, controller.ProvisioningFinished, nil
 }
 
 /*
  * Delete: remove a PV from the disk by deleting its directory.
  */
-func (p *hostPathProvisioner) Delete(volume *v1.PersistentVolume) error {
+func (p *hostPathProvisioner) Delete(ctx context.Context, volume *v1.PersistentVolume) error {
 	/* Ensure this volume was provisioned by us */
 	ann, ok := volume.Annotations[provisionerIDAnn]
 	if !ok {
@@ -168,7 +168,8 @@ func (p *hostPathProvisioner) Delete(volume *v1.PersistentVolume) error {
 	 * directly, but this feels more correct.
 	 */
 	class, err := p.client.StorageV1beta1().StorageClasses().Get(
-		helper.GetPersistentVolumeClass(volume),
+		ctx,
+		util.GetPersistentVolumeClass(volume),
 		metav1.GetOptions{})
 	if err != nil {
 		glog.Infof("not removing volume <%s>: failed to fetch storageclass: %s",
@@ -294,5 +295,5 @@ func main() {
 		hostPathProvisioner,
 		serverVersion.GitVersion)
 
-	pc.Run(wait.NeverStop)
+	pc.Run(context.Background())
 }
